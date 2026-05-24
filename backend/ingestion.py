@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import asyncio
+import random
 
 import chromadb
 import httpx
@@ -49,9 +50,10 @@ CHUNK_TOKENS = 512
 OVERLAP_TOKENS = 20
 EMBED_BATCH = 100
 MAX_FILE_KB = 100        # skip files larger than this
-MAX_CHUNKS_PER_FILE = 6  # per-file cap so every file gets indexed, not just the first N
-EMBED_CONCURRENCY = 1    # sequential — free tier bursts cause 429 at higher concurrency
-EMBED_DELAY = 0.1        # seconds between requests
+MAX_CHUNKS_PER_FILE = 4  # per-file cap
+MAX_TOTAL_CHUNKS = 150   # global cap — keeps embedding fast on free-tier API keys
+EMBED_CONCURRENCY = 3    # 3 concurrent keeps RPM well under free-tier limits
+EMBED_DELAY = 0.4        # seconds between requests per worker
 
 
 def _lang(path: str) -> str:
@@ -250,18 +252,21 @@ async def _embed_one(
         "content": {"parts": [{"text": text}]},
         "taskType": task_type,
     }
-    backoff = 5
-    for attempt in range(10):
+    # Stagger workers on first attempt to prevent thundering herd
+    await asyncio.sleep(random.uniform(0, 0.5))
+    backoff = 2.0
+    for attempt in range(12):
         async with sem:
-            resp = await client.post(url, json=payload, timeout=30)
+            resp = await client.post(url, json=payload, timeout=12)
             await asyncio.sleep(EMBED_DELAY)
         if resp.status_code == 429:
-            await asyncio.sleep(backoff)
+            # Full jitter: sleep random in [0, backoff] so workers desync
+            await asyncio.sleep(random.uniform(0, backoff))
             backoff = min(backoff * 2, 60)
             continue
         resp.raise_for_status()
         return resp.json()["embedding"]["values"]
-    raise RuntimeError("Embedding failed after 10 retries")
+    raise RuntimeError("Embedding failed after 12 retries")
 
 
 async def embed_chunks(
@@ -273,23 +278,39 @@ async def embed_chunks(
     total = len(chunks)
     results: list[list[float] | None] = [None] * total
     completed = 0
+    consecutive_429s = 0  # shared counter to detect quota exhaustion
 
     async def run_one(i: int, text: str, client: httpx.AsyncClient):
-        nonlocal completed
-        emb = await _embed_one(text, api_key, "RETRIEVAL_DOCUMENT", client, sem)
-        results[i] = emb
-        completed += 1
-        if progress_queue is not None and completed % 5 == 0:
-            pct = 40 + int((completed / total) * 40)
-            await progress_queue.put(
-                {"step": "embedding", "file": f"{completed}/{total} chunks", "progress_pct": pct}
-            )
+        nonlocal completed, consecutive_429s
+        try:
+            emb = await _embed_one(text, api_key, "RETRIEVAL_DOCUMENT", client, sem)
+            results[i] = emb
+            consecutive_429s = 0  # reset on success
+        except RuntimeError as e:
+            consecutive_429s += 1
+            # After 6 consecutive total failures, signal quota error to UI
+            if consecutive_429s >= 6 and progress_queue is not None:
+                await progress_queue.put({
+                    "step": "error",
+                    "file": "Gemini API quota exhausted. Wait a minute and try again, or check your Google AI Studio quota.",
+                    "progress_pct": 40,
+                })
+        except Exception:
+            pass
+        finally:
+            completed += 1
+            if progress_queue is not None and completed % 3 == 0:
+                pct = 40 + int((completed / total) * 40)
+                await progress_queue.put(
+                    {"step": "embedding", "file": f"{completed}/{total} chunks", "progress_pct": pct}
+                )
 
-    async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[run_one(i, c["text"], client) for i, c in enumerate(chunks)])
-
-    if progress_queue is not None:
-        await progress_queue.put(None)  # sentinel: done
+    try:
+        async with httpx.AsyncClient() as client:
+            await asyncio.gather(*[run_one(i, c["text"], client) for i, c in enumerate(chunks)])
+    finally:
+        if progress_queue is not None:
+            await progress_queue.put(None)
 
     return results  # type: ignore
 
@@ -339,11 +360,20 @@ async def ingest_repo(
     all_chunks = []
     for info in file_infos:
         file_chunks = chunk_file(info)
-        # Cap per file but always keep the first and last chunk for context
         if len(file_chunks) > MAX_CHUNKS_PER_FILE:
             keep = file_chunks[:MAX_CHUNKS_PER_FILE - 1] + [file_chunks[-1]]
             file_chunks = keep
         all_chunks.extend(file_chunks)
+
+    # Global cap: prioritise files with more symbols (more useful for RAG)
+    if len(all_chunks) > MAX_TOTAL_CHUNKS:
+        # Sort by symbol_count desc so important files keep more chunks
+        chunk_priority = {
+            info["path"]: len(info["symbols"]) + len(info["imports"])
+            for info in file_infos
+        }
+        all_chunks.sort(key=lambda c: chunk_priority.get(c["file_path"], 0), reverse=True)
+        all_chunks = all_chunks[:MAX_TOTAL_CHUNKS]
 
     yield {"step": "embedding", "file": f"{len(all_chunks)} chunks", "progress_pct": 40}
 
@@ -353,11 +383,17 @@ async def ingest_repo(
         embed_chunks(all_chunks, gemini_api_key, progress_queue)
     )
 
-    # Drain progress events while embedding runs
+    # Drain progress with heartbeat so SSE stays alive during long backoffs
+    last_pct = 40
     while True:
-        event = await progress_queue.get()
+        try:
+            event = await asyncio.wait_for(progress_queue.get(), timeout=6.0)
+        except asyncio.TimeoutError:
+            yield {"step": "embedding", "file": "waiting for API...", "progress_pct": last_pct}
+            continue
         if event is None:  # sentinel: embedding finished
             break
+        last_pct = event.get("progress_pct", last_pct)
         yield event
 
     embeddings = await embed_task
@@ -371,7 +407,9 @@ async def ingest_repo(
         pass
     col = chroma.get_or_create_collection(repo_id)
 
-    ids = [f"{repo_id}_{i}" for i in range(len(all_chunks))]
+    # Drop any chunks whose embedding failed (None)
+    valid = [(i, c, e) for i, (c, e) in enumerate(zip(all_chunks, embeddings)) if e is not None]
+    ids = [f"{repo_id}_{i}" for i, _, _ in valid]
     metadatas = [
         {
             "file_path": c["file_path"],
@@ -379,15 +417,16 @@ async def ingest_repo(
             "start_token": c["start_token"],
             "repo_id": repo_id,
         }
-        for c in all_chunks
+        for _, c, _ in valid
     ]
-    documents = [c["text"] for c in all_chunks]
+    documents = [c["text"] for _, c, _ in valid]
+    embeds   = [e         for _, _, e in valid]
 
     batch_size = 500
     for i in range(0, len(ids), batch_size):
         col.upsert(
             ids=ids[i : i + batch_size],
-            embeddings=embeddings[i : i + batch_size],
+            embeddings=embeds[i : i + batch_size],
             documents=documents[i : i + batch_size],
             metadatas=metadatas[i : i + batch_size],
         )

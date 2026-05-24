@@ -73,6 +73,10 @@ export default function LandingPage() {
             if (ev.step === 'result') {
               const id = repoIdFromUrl(url)
               setTimeout(() => router.push(`/workspace?repo_id=${id}`), 700)
+            } else if (ev.step === 'error') {
+              setError(ev.file)
+              setLoading(false)
+              return
             }
           } catch { /**/ }
         }
@@ -215,7 +219,10 @@ export default function LandingPage() {
               </div>
 
               {progress.file && (
-                <p className="text-[11px] font-mono truncate" style={{ color: 'var(--subtle)' }}>{progress.file}</p>
+                <p className="text-[11px] font-mono truncate flex items-center gap-1.5" style={{ color: progress.file.startsWith('waiting') ? 'var(--muted)' : 'var(--subtle)' }}>
+                  {progress.file.startsWith('waiting') && <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 spin" style={{ background: 'var(--accent)', animation: 'pulse-ring 1.5s ease-out infinite' }} />}
+                  {progress.file}
+                </p>
               )}
               {progress.step === 'result' && (
                 <p className="text-sm font-medium" style={{ color: 'var(--green-text)' }}>
