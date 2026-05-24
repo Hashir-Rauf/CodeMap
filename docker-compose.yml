@@ -1,0 +1,15 @@
+version: '3.9'
+
+services:
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider
+      - ALLOW_RESET=true
+
+volumes:
+  chroma_data:
